@@ -1,4 +1,4 @@
-# 🌱 PlanNet – A Plant Nursery Management System
+# 🌱 PlantNet – A Plant Nursery Management System
 
 ## 🎯 Project Purpose
 PlanNet is a comprehensive web application designed to bridge the gap between plant sellers and nature enthusiasts.  
