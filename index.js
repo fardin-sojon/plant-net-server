@@ -112,72 +112,87 @@ async function run() {
 
     // Payment endpoints
     app.post('/create-checkout-session', async (req, res) => {
-      const paymentInfo = req.body;
-      // console.log(paymentInfo);
-      const session = await stripe.checkout.sessions.create({
-        line_items: [
-          {
-            price_data: {
-              currency: 'usd',
-              product_data: {
-                name: paymentInfo?.name,
-                description: paymentInfo?.description,
-                images: [paymentInfo?.image],
-              },
-              unit_amount: paymentInfo?.price * 100,
-            },
-            quantity: paymentInfo?.quantity,
-          },
-        ],
-        customer_email: paymentInfo?.customer?.email,
-        mode: 'payment',
-        metadata: {
-          plantId: paymentInfo?.plantId,
-          customer: paymentInfo?.customer.email,
+      const { items, customer } = req.body;
+      const price = items.reduce((total, item) => total + item.price * item.quantity, 0);
 
+      const lineItems = items.map(item => ({
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: item.name,
+            images: [item.image],
+          },
+          unit_amount: Math.round(item.price * 100),
         },
+        quantity: item.quantity,
+      }));
+
+      const session = await stripe.checkout.sessions.create({
+        line_items: lineItems,
+        customer_email: customer.email,
+        mode: 'payment',
         success_url: `${process.env.DOMAIN_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.DOMAIN_URL}/plant/${paymentInfo?.plantId}`,
-      })
-      res.send({ url: session.url })
+        cancel_url: `${process.env.DOMAIN_URL}/cart`,
+      });
+
+      // Create Pending Orders
+      const orders = items.map(item => ({
+        plantId: item._id,
+        transactionId: session.id, // Use session ID as temporary transaction ID
+        customer: customer.email,
+        status: 'Pending',
+        seller: item.seller, // Ensure this exists in plant object
+        name: item.name,
+        category: item.category,
+        quantity: item.quantity,
+        price: item.price,
+        image: item.image,
+        address: customer.address || 'Dhaka' // ideally get from profile
+      }));
+
+      await ordersCollection.insertMany(orders);
+
+      res.send({ url: session.url });
     })
 
     app.post('/payment-success', async (req, res) => {
-      const { sessionId } = req.body
+      const { sessionId } = req.body;
       const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-      const plant = await plantsCollection.findOne({ _id: new ObjectId(session.metadata.plantId) })
+      if (session.payment_status === 'paid') {
+        const transactionId = session.id;
+        const paymentIntentId = session.payment_intent;
 
+        // 1. Update Order Status
+        const updateResult = await ordersCollection.updateMany(
+          { transactionId: transactionId },
+          {
+            $set: {
+              status: 'Paid',
+              transactionId: paymentIntentId // Update to actual payment intent
+            }
+          }
+        );
 
-      const order = await ordersCollection.findOne({ transactionId: session.payment_intent })
+        // 2. Decrement Quantity (More complex with multiple items, need to iterate)
+        // Find the orders we just updated to know which plants to decrement
+        const orders = await ordersCollection.find({ transactionId: paymentIntentId }).toArray();
 
-      if (session.status = 'complete' && plant && !order) {
-        // Fetch user to get address
-        const user = await usersCollection.findOne({ email: session.metadata.customer })
-
-        // save order data in db
-        const orderInfo = {
-          plantId: session.metadata.plantId,
-          transactionId: session.payment_intent,
-          customer: session.metadata.customer,
-          status: 'Pending',
-          seller: plant.seller,
-          name: plant.name,
-          category: plant.category,
-          quantity: 1,
-          price: session.amount_total / 100,
-          image: plant?.image,
-          address: user?.address || 'Dhaka' // Fallback to 'Dhaka' if not set
+        for (const order of orders) {
+          await plantsCollection.updateOne(
+            { _id: new ObjectId(order.plantId) },
+            { $inc: { quantity: -order.quantity } }
+          );
         }
-        const result = await ordersCollection.insertOne(orderInfo)
-        // update plant quantity
-        await plantsCollection.updateOne(
-          { _id: new ObjectId(session.metadata.plantId) },
-          { $inc: { quantity: -1 } }
-        )
-        return res.send({ transactionId: session.payment_intent, orderId: result.insertedId })
+
+        if (updateResult.modifiedCount > 0) {
+          res.send({ transactionId: paymentIntentId, success: true });
+        } else {
+          res.status(400).send({ message: 'No orders found to update', success: false });
+        }
+      } else {
+        res.status(400).send({ message: 'Payment not successful', success: false });
       }
-      res.send(res.send({ transactionId: session.payment_intent, orderId: order._id }))
     })
 
     // update a plant
@@ -308,7 +323,11 @@ async function run() {
       const user = req.body
       const query = { email }
       const updateDoc = {
-        $set: { ...user, status: null, timestamp: Date.now() },
+        $set: { ...user, timestamp: Date.now() },
+      }
+      // If status is not provided (e.g. role update), clear the status
+      if (!user.status) {
+        updateDoc.$set.status = null
       }
       const result = await usersCollection.updateOne(query, updateDoc)
       res.send(result)
