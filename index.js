@@ -58,6 +58,7 @@ async function run() {
     const plantsCollection = db.collection('plants')
     const ordersCollection = db.collection('orders')
     const usersCollection = db.collection('users')
+    const paymentsCollection = db.collection('payments')
 
     // save a plant data in db
     app.post('/plants', async (req, res) => {
@@ -147,7 +148,9 @@ async function run() {
         quantity: item.quantity,
         price: item.price,
         image: item.image,
-        address: customer.address || 'Dhaka' // ideally get from profile
+        address: customer.address || 'Dhaka', // ideally get from profile
+        createdAt: new Date(),
+        timestamp: Date.now()
       }));
 
       await ordersCollection.insertMany(orders);
@@ -156,42 +159,75 @@ async function run() {
     })
 
     app.post('/payment-success', async (req, res) => {
-      const { sessionId } = req.body;
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      try {
+        const { sessionId } = req.body;
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
 
-      if (session.payment_status === 'paid') {
-        const transactionId = session.id;
-        const paymentIntentId = session.payment_intent;
+        if (session.payment_status === 'paid') {
+          const transactionId = session.id;
+          const paymentIntentId = session.payment_intent;
 
-        // 1. Update Order Status
-        const updateResult = await ordersCollection.updateMany(
-          { transactionId: transactionId },
-          {
-            $set: {
-              status: 'Paid',
-              transactionId: paymentIntentId // Update to actual payment intent
+          // 1. Find orders BEFORE updating (using original session.id)
+          let orders = await ordersCollection.find({ transactionId: transactionId }).toArray();
+
+          // If no orders found with session.id, check if already processed
+          if (orders.length === 0) {
+            orders = await ordersCollection.find({ transactionId: paymentIntentId }).toArray();
+
+            // If found with paymentIntentId, already processed - return success
+            if (orders.length > 0) {
+              return res.send({ transactionId: paymentIntentId, success: true });
             }
+
+            // Otherwise return error
+            return res.status(400).send({ message: 'No orders found for this session', success: false });
           }
-        );
 
-        // 2. Decrement Quantity (More complex with multiple items, need to iterate)
-        // Find the orders we just updated to know which plants to decrement
-        const orders = await ordersCollection.find({ transactionId: paymentIntentId }).toArray();
-
-        for (const order of orders) {
-          await plantsCollection.updateOne(
-            { _id: new ObjectId(order.plantId) },
-            { $inc: { quantity: -order.quantity } }
+          // 2. Update Order Status
+          const updateResult = await ordersCollection.updateMany(
+            { transactionId: transactionId },
+            {
+              $set: {
+                status: 'Pending',
+                transactionId: paymentIntentId // Update to actual payment intent
+              }
+            }
           );
-        }
 
-        if (updateResult.modifiedCount > 0) {
+          // 3. Decrement Quantity for each plant
+          for (const order of orders) {
+            await plantsCollection.updateOne(
+              { _id: new ObjectId(order.plantId) },
+              { $inc: { quantity: -order.quantity } }
+            );
+          }
+
+          // 4. Save payment data to payments collection
+          const paymentData = {
+            sessionId: session.id,
+            paymentIntentId: paymentIntentId,
+            customer: session.customer_email,
+            amount: session.amount_total / 100, // Convert from cents to dollars
+            currency: session.currency,
+            paymentStatus: session.payment_status,
+            items: orders.map(order => ({
+              plantId: order.plantId,
+              name: order.name,
+              quantity: order.quantity,
+              price: order.price
+            })),
+            createdAt: new Date(),
+            timestamp: Date.now()
+          }
+          await paymentsCollection.insertOne(paymentData)
+
           res.send({ transactionId: paymentIntentId, success: true });
         } else {
-          res.status(400).send({ message: 'No orders found to update', success: false });
+          res.status(400).send({ message: 'Payment not successful', success: false });
         }
-      } else {
-        res.status(400).send({ message: 'Payment not successful', success: false });
+      } catch (error) {
+        console.error('Payment success error:', error);
+        res.status(500).send({ message: error.message, success: false });
       }
     })
 
@@ -257,6 +293,8 @@ async function run() {
       const result = await usersCollection.insertOne({
         ...user,
         role: 'customer',
+        status: null,
+        address: null,
         timestamp: Date.now(),
       })
       res.send(result)
@@ -273,6 +311,57 @@ async function run() {
       const result = await ordersCollection.updateOne(query, updateDoc)
       res.send(result)
     })
+
+    // Get seller's orders
+    app.get('/manage-orders/:email', verifyJWT, async (req, res) => {
+      const email = req.params.email
+      // Handle seller as object with email property
+      const query = {
+        $or: [
+          { seller: email },
+          { 'seller.email': email }
+        ]
+      }
+      const result = await ordersCollection.find(query).toArray()
+      res.send(result)
+    })
+
+    // Get all orders for admin
+    app.get('/admin-orders', verifyJWT, async (req, res) => {
+      const result = await ordersCollection.find().toArray()
+      res.send(result)
+    })
+
+    // Get customer's orders  
+    app.get('/my-orders/:email', verifyJWT, async (req, res) => {
+      const email = req.params.email
+      const query = { customer: email }
+      const result = await ordersCollection.find(query).toArray()
+      res.send(result)
+    })
+
+    // Get all payments (admin)
+    app.get('/payments', verifyJWT, async (req, res) => {
+      const result = await paymentsCollection.find().sort({ timestamp: -1 }).toArray()
+      res.send(result)
+    })
+
+    // Get customer's payment history
+    app.get('/my-payments/:email', verifyJWT, async (req, res) => {
+      const email = req.params.email
+      const query = { customer: email }
+      const result = await paymentsCollection.find(query).sort({ timestamp: -1 }).toArray()
+      res.send(result)
+    })
+
+    // Get payment by transaction ID
+    app.get('/payment/:transactionId', verifyJWT, async (req, res) => {
+      const transactionId = req.params.transactionId
+      const query = { paymentIntentId: transactionId }
+      const result = await paymentsCollection.findOne(query)
+      res.send(result)
+    })
+
 
     // get all users
     // verifyAdmin
