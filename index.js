@@ -25,8 +25,18 @@ const verifyJWT = async (req, res, next) => {
   if (!token) return res.status(401).send({ message: 'Unauthorized Access!' })
   try {
     const decoded = await admin.auth().verifyIdToken(token)
-    req.tokenEmail = decoded.email
-    // console.log(decoded)
+    let email = decoded.email
+    if (!email && decoded.uid) {
+      try {
+        const userRecord = await admin.auth().getUser(decoded.uid)
+        email = userRecord.email || userRecord.providerData?.[0]?.email
+      } catch (userErr) {
+        console.error('Error fetching user by uid:', userErr)
+      }
+    }
+    req.tokenEmail = email
+    const fs = require('fs')
+    fs.appendFileSync('debug.log', `[verifyJWT] Email: ${email}, Decoded token: ${JSON.stringify(decoded)}\n`)
     next()
   } catch (err) {
     // console.log(err)
@@ -59,6 +69,7 @@ async function run() {
     const ordersCollection = db.collection('orders')
     const usersCollection = db.collection('users')
     const paymentsCollection = db.collection('payments')
+    const contactCollection = db.collection('messages')
 
     // save a plant data in db
     app.post('/plants', async (req, res) => {
@@ -68,36 +79,23 @@ async function run() {
       res.send(result);
     })
 
-    // get all orders for a customer email
-    app.get('/my-orders/:email', async (req, res) => {
-      const email = req.params.email;
-      const result = await ordersCollection.find({ customer: email }).toArray();
-      res.send(result);
-    });
 
-    // get all orders for a seller email
-    app.get('/manage-order/:email', async (req, res) => {
-      const email = req.params.email;
-      const result = await ordersCollection.find({ 'seller.email': email }).toArray();
-      res.send(result);
-    });
-
-    // get all orders for admin
-    app.get('/admin-orders', async (req, res) => {
-      const result = await ordersCollection.find().toArray();
-      res.send(result);
-    });
 
     // get all plant for a seller by email
     app.get('/my-inventory/:email', async (req, res) => {
       const email = req.params.email;
-      const result = await plantsCollection.find({ 'seller.email': email }).toArray();
+      const user = await usersCollection.findOne({ email });
+      let query = { 'seller.email': email };
+      if (user && user.role === 'admin') {
+        query = {}; // Admin can see all plants
+      }
+      const result = await plantsCollection.find(query).sort({ _id: -1 }).toArray();
       res.send(result);
     });
 
     // get all plants from db
     app.get('/plants', async (req, res) => {
-      const cursor = plantsCollection.find()
+      const cursor = plantsCollection.find().sort({ _id: -1 })
       const result = await cursor.toArray();
       res.send(result)
     })
@@ -113,49 +111,56 @@ async function run() {
 
     // Payment endpoints
     app.post('/create-checkout-session', async (req, res) => {
-      const { items, customer } = req.body;
-      const price = items.reduce((total, item) => total + item.price * item.quantity, 0);
+      try {
+        const { items, customer } = req.body;
+        const price = items.reduce((total, item) => total + item.price * item.quantity, 0);
 
-      const lineItems = items.map(item => ({
-        price_data: {
-          currency: 'usd',
-          product_data: {
-            name: item.name,
-            images: [item.image],
+        const lineItems = items.map(item => ({
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: item.name,
+              images: [item.image],
+            },
+            unit_amount: Math.round(item.price * 100),
           },
-          unit_amount: Math.round(item.price * 100),
-        },
-        quantity: item.quantity,
-      }));
+          quantity: item.quantity,
+        }));
 
-      const session = await stripe.checkout.sessions.create({
-        line_items: lineItems,
-        customer_email: customer.email,
-        mode: 'payment',
-        success_url: `${process.env.DOMAIN_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${process.env.DOMAIN_URL}/cart`,
-      });
+        const session = await stripe.checkout.sessions.create({
+          line_items: lineItems,
+          customer_email: customer.email,
+          mode: 'payment',
+          success_url: `${process.env.DOMAIN_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+          cancel_url: `${process.env.DOMAIN_URL}/cart`,
+        });
 
-      // Create Pending Orders
-      const orders = items.map(item => ({
-        plantId: item._id,
-        transactionId: session.id, // Use session ID as temporary transaction ID
-        customer: customer.email,
-        status: 'Pending',
-        seller: item.seller, // Ensure this exists in plant object
-        name: item.name,
-        category: item.category,
-        quantity: item.quantity,
-        price: item.price,
-        image: item.image,
-        address: customer.address || 'Dhaka', // ideally get from profile
-        createdAt: new Date(),
-        timestamp: Date.now()
-      }));
+        // Create Pending Orders
+        const orders = items.map(item => ({
+          plantId: item._id,
+          transactionId: session.id, // Use session ID as temporary transaction ID
+          customer: customer.email,
+          customerName: customer.recipientName || customer.name || '',
+          status: 'Pending',
+          seller: item.seller, // Ensure this exists in plant object
+          name: item.name,
+          category: item.category,
+          quantity: item.quantity,
+          price: item.price,
+          image: item.image,
+          address: customer.address || 'Dhaka',
+          phone: customer.phone || '',
+          createdAt: new Date(),
+          timestamp: Date.now()
+        }));
 
-      await ordersCollection.insertMany(orders);
+        await ordersCollection.insertMany(orders);
 
-      res.send({ url: session.url });
+        res.send({ url: session.url });
+      } catch (error) {
+        console.error('Error creating checkout session:', error);
+        res.status(400).send({ message: error.message });
+      }
     })
 
     app.post('/payment-success', async (req, res) => {
@@ -207,9 +212,12 @@ async function run() {
             sessionId: session.id,
             paymentIntentId: paymentIntentId,
             customer: session.customer_email,
+            customerName: orders[0]?.customerName || '',
             amount: session.amount_total / 100, // Convert from cents to dollars
             currency: session.currency,
             paymentStatus: session.payment_status,
+            address: orders[0]?.address || '',
+            phone: orders[0]?.phone || '',
             items: orders.map(order => ({
               plantId: order.plantId,
               name: order.name,
@@ -322,13 +330,13 @@ async function run() {
           { 'seller.email': email }
         ]
       }
-      const result = await ordersCollection.find(query).toArray()
+      const result = await ordersCollection.find(query).sort({ _id: -1 }).toArray()
       res.send(result)
     })
 
     // Get all orders for admin
     app.get('/admin-orders', verifyJWT, async (req, res) => {
-      const result = await ordersCollection.find().toArray()
+      const result = await ordersCollection.find().sort({ _id: -1 }).toArray()
       res.send(result)
     })
 
@@ -336,7 +344,7 @@ async function run() {
     app.get('/my-orders/:email', verifyJWT, async (req, res) => {
       const email = req.params.email
       const query = { customer: email }
-      const result = await ordersCollection.find(query).toArray()
+      const result = await ordersCollection.find(query).sort({ _id: -1 }).toArray()
       res.send(result)
     })
 
@@ -367,6 +375,14 @@ async function run() {
     // verifyAdmin
     app.get('/users', verifyJWT, async (req, res) => {
       const result = await usersCollection.find().toArray()
+      res.send(result)
+    })
+
+    // delete user by id
+    app.delete('/users/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const result = await usersCollection.deleteOne(query)
       res.send(result)
     })
 
@@ -429,6 +445,53 @@ async function run() {
       res.send(result)
     })
 
+    // save a contact message
+    app.post('/contact-messages', async (req, res) => {
+      const message = req.body
+      const result = await contactCollection.insertOne({
+        ...message,
+        createdAt: new Date(),
+        timestamp: Date.now()
+      })
+      res.send(result)
+    })
+
+    // get all contact messages (admin only)
+    app.get('/contact-messages', verifyJWT, async (req, res) => {
+      const fs = require('fs')
+      const requesterEmail = req.tokenEmail
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+      
+      fs.appendFileSync('debug.log', `[GET /contact-messages] Email: ${requesterEmail}, Found User: ${requesterUser ? requesterUser.email : 'null'}, Role: ${requesterUser ? requesterUser.role : 'none'}\n`)
+
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const result = await contactCollection.find().sort({ _id: -1 }).toArray()
+      res.send(result)
+    })
+
+    // delete a contact message (admin only)
+    app.delete('/contact-messages/:id', verifyJWT, async (req, res) => {
+      const fs = require('fs')
+      const requesterEmail = req.tokenEmail
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+
+      fs.appendFileSync('debug.log', `[DELETE /contact-messages] Email: ${requesterEmail}, Found User: ${requesterUser ? requesterUser.email : 'null'}, Role: ${requesterUser ? requesterUser.role : 'none'}\n`)
+
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const result = await contactCollection.deleteOne(query)
+      res.send(result)
+    })
+
 
 
 
@@ -459,3 +522,5 @@ const port = process.env.PORT || 3000
 app.listen(port, () => {
   // console.log(`Server is running on port ${port}`)
 })
+
+module.exports = app;
