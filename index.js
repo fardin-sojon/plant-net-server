@@ -11,7 +11,12 @@ const app = express()
 // middleware
 app.use(
   cors({
-    origin: [process.env.DOMAIN_URL],
+    origin: [
+      'http://localhost:5173',
+      'https://fardins.shop',
+      'https://plant-net-11.web.app',
+      'https://plant-net-11.firebaseapp.com'
+    ],
     credentials: true,
     optionSuccessStatus: 200,
   })
@@ -35,8 +40,6 @@ const verifyJWT = async (req, res, next) => {
       }
     }
     req.tokenEmail = email
-    const fs = require('fs')
-    fs.appendFileSync('debug.log', `[verifyJWT] Email: ${email}, Decoded token: ${JSON.stringify(decoded)}\n`)
     next()
   } catch (err) {
     // console.log(err)
@@ -64,6 +67,16 @@ const client = new MongoClient(process.env.MONGODB_URI, {
 
 async function run() {
   try {
+
+    app.use(async (req, res, next) => {
+      try {
+        await client.connect()
+        next()
+      } catch (err) {
+        next(err)
+      }
+    })
+
     const db = client.db('plantsDB')
     const plantsCollection = db.collection('plants')
     const ordersCollection = db.collection('orders')
@@ -458,13 +471,10 @@ async function run() {
 
     // get all contact messages (admin only)
     app.get('/contact-messages', verifyJWT, async (req, res) => {
-      const fs = require('fs')
       const requesterEmail = req.tokenEmail
       const requesterUser = await usersCollection.findOne({ 
         email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
       })
-      
-      fs.appendFileSync('debug.log', `[GET /contact-messages] Email: ${requesterEmail}, Found User: ${requesterUser ? requesterUser.email : 'null'}, Role: ${requesterUser ? requesterUser.role : 'none'}\n`)
 
       if (!requesterUser || requesterUser.role !== 'admin') {
         return res.status(403).send({ message: 'Forbidden access' })
@@ -475,13 +485,10 @@ async function run() {
 
     // delete a contact message (admin only)
     app.delete('/contact-messages/:id', verifyJWT, async (req, res) => {
-      const fs = require('fs')
       const requesterEmail = req.tokenEmail
       const requesterUser = await usersCollection.findOne({ 
         email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
       })
-
-      fs.appendFileSync('debug.log', `[DELETE /contact-messages] Email: ${requesterEmail}, Found User: ${requesterUser ? requesterUser.email : 'null'}, Role: ${requesterUser ? requesterUser.role : 'none'}\n`)
 
       if (!requesterUser || requesterUser.role !== 'admin') {
         return res.status(403).send({ message: 'Forbidden access' })
