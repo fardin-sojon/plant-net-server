@@ -185,3 +185,10 @@ npm run dev
 
 - 📦 **Frontend (Client):** [https://github.com/fardin-sojon/plant-net-client](https://github.com/fardin-sojon/plant-net-client)
 - 🛠️ **Backend (Server):** [https://github.com/fardin-sojon/plant-net-server](https://github.com/fardin-sojon/plant-net-server)
+
+---
+
+## 👨‍💻 Developer
+
+**Fardin Rahman Sojon**  
+🌐 [fardins.shop](https://fardins.shop) · 🐙 [github.com/fardin-sojon](https://github.com/fardin-sojon)
