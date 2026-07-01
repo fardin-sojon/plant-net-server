@@ -83,6 +83,9 @@ async function run() {
     const usersCollection = db.collection('users')
     const paymentsCollection = db.collection('payments')
     const contactCollection = db.collection('messages')
+    const wishlistCollection = db.collection('wishlist')
+    const reviewsCollection = db.collection('reviews')
+    const couponsCollection = db.collection('coupons')
 
     // save a plant data in db
     app.post('/plants', async (req, res) => {
@@ -125,8 +128,24 @@ async function run() {
     // Payment endpoints
     app.post('/create-checkout-session', async (req, res) => {
       try {
-        const { items, customer } = req.body;
+        const { items, customer, couponCode } = req.body;
         const price = items.reduce((total, item) => total + item.price * item.quantity, 0);
+
+        let discount = 0;
+        let discountRatio = 1;
+
+        if (couponCode) {
+          const coupon = await couponsCollection.findOne({ code: couponCode.toUpperCase() });
+          if (coupon) {
+            if (coupon.discountType === 'percent') {
+              discount = (parseFloat(coupon.discountAmount) / 100) * price;
+            } else {
+              discount = parseFloat(coupon.discountAmount);
+            }
+            discount = Math.min(discount, price);
+            discountRatio = (price - discount) / price;
+          }
+        }
 
         const lineItems = items.map(item => ({
           price_data: {
@@ -135,7 +154,7 @@ async function run() {
               name: item.name,
               images: [item.image],
             },
-            unit_amount: Math.round(item.price * 100),
+            unit_amount: Math.round(item.price * discountRatio * 100),
           },
           quantity: item.quantity,
         }));
@@ -159,7 +178,7 @@ async function run() {
           name: item.name,
           category: item.category,
           quantity: item.quantity,
-          price: item.price,
+          price: Math.round(item.price * discountRatio * 100) / 100, // Apply discount proportionally
           image: item.image,
           address: customer.address || 'Dhaka',
           phone: customer.phone || '',
@@ -501,10 +520,114 @@ async function run() {
 
 
 
+    // --- Wishlist Endpoints ---
+    app.post('/wishlist', verifyJWT, async (req, res) => {
+      const wishlistItem = req.body
+      const query = { email: wishlistItem.email, plantId: wishlistItem.plantId }
+      const exist = await wishlistCollection.findOne(query)
+      if (exist) {
+        return res.status(409).send({ message: 'Already wishlisted!' })
+      }
+      const result = await wishlistCollection.insertOne({
+        ...wishlistItem,
+        timestamp: Date.now()
+      })
+      res.send(result)
+    })
 
+    app.get('/wishlist/:email', verifyJWT, async (req, res) => {
+      const email = req.params.email
+      const query = { email: email }
+      const result = await wishlistCollection.find(query).toArray()
+      res.send(result)
+    })
 
+    app.delete('/wishlist/:id', verifyJWT, async (req, res) => {
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const result = await wishlistCollection.deleteOne(query)
+      res.send(result)
+    })
 
+    // --- Reviews Endpoints ---
+    app.post('/reviews', verifyJWT, async (req, res) => {
+      const review = req.body
+      const result = await reviewsCollection.insertOne({
+        ...review,
+        timestamp: Date.now(),
+        createdAt: new Date()
+      })
+      res.send(result)
+    })
 
+    app.get('/reviews/:plantId', async (req, res) => {
+      const plantId = req.params.plantId
+      const query = { plantId: plantId }
+      const result = await reviewsCollection.find(query).sort({ timestamp: -1 }).toArray()
+      res.send(result)
+    })
+
+    // --- Coupons Endpoints ---
+    app.post('/coupons', verifyJWT, async (req, res) => {
+      const requesterEmail = req.tokenEmail
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const coupon = req.body
+      const result = await couponsCollection.insertOne({
+        ...coupon,
+        code: coupon.code.toUpperCase(),
+        timestamp: Date.now()
+      })
+      res.send(result)
+    })
+
+    app.get('/coupons', verifyJWT, async (req, res) => {
+      const result = await couponsCollection.find().sort({ _id: -1 }).toArray()
+      res.send(result)
+    })
+
+    app.delete('/coupons/:id', verifyJWT, async (req, res) => {
+      const requesterEmail = req.tokenEmail
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const result = await couponsCollection.deleteOne(query)
+      res.send(result)
+    })
+
+    app.post('/coupons/apply', async (req, res) => {
+      const { code, cartTotal } = req.body
+      if (!code) return res.status(400).send({ message: 'Coupon code required' })
+      const query = { code: code.toUpperCase() }
+      const coupon = await couponsCollection.findOne(query)
+      if (!coupon) {
+        return res.status(404).send({ message: 'Invalid coupon code', success: false })
+      }
+      let discount = 0
+      if (coupon.discountType === 'percent') {
+        discount = (parseFloat(coupon.discountAmount) / 100) * cartTotal
+      } else {
+        discount = parseFloat(coupon.discountAmount)
+      }
+      discount = Math.min(discount, cartTotal)
+      const finalTotal = cartTotal - discount
+      res.send({
+        success: true,
+        discount,
+        finalTotal,
+        discountType: coupon.discountType,
+        discountAmount: coupon.discountAmount
+      })
+    })
 
     // ping MongoDB
     await client.db('admin').command({ ping: 1 })
