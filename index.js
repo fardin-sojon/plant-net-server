@@ -300,20 +300,63 @@ async function run() {
     });
 
     // delete a order
-    app.delete('/orders/:id', async (req, res) => {
+    app.delete('/orders/:id', verifyJWT, async (req, res) => {
       const id = req.params.id
-      const query = { _id: new ObjectId(id) }
-      const order = await ordersCollection.findOne(query)
-      if (order.status === 'Delivered')
+      const requesterEmail = req.tokenEmail
+
+      const targetOrder = await ordersCollection.findOne({ _id: new ObjectId(id) })
+      if (!targetOrder) {
+        return res.status(404).send({ message: 'Order not found' })
+      }
+
+      // Check role of requester
+      const user = await usersCollection.findOne({ email: requesterEmail })
+      const isAdmin = user && user.role === 'admin'
+
+      const transactionId = targetOrder.transactionId
+
+      // Define filter to cancel orders under the same transaction
+      let filter = { transactionId: transactionId }
+      if (!isAdmin && user && user.role === 'seller') {
+        filter = {
+          transactionId: transactionId,
+          $or: [
+            { seller: requesterEmail },
+            { 'seller.email': requesterEmail }
+          ]
+        }
+      }
+      if (!isAdmin && (!user || user.role === 'customer')) {
+        filter = {
+          transactionId: transactionId,
+          customer: requesterEmail
+        }
+      }
+
+      const ordersToCancel = await ordersCollection.find(filter).toArray()
+      if (ordersToCancel.length === 0) {
+        return res.status(404).send({ message: 'No orders found to cancel' })
+      }
+
+      // Check if any order is already in progress or delivered
+      const cannotCancel = ordersToCancel.some(
+        order => order.status === 'Delivered' || order.status === 'In Progress'
+      )
+      if (cannotCancel) {
         return res
           .status(409)
-          .send({ message: 'Cannot cancel once the product is delivered!' })
-      const result = await ordersCollection.deleteOne(query)
-      const updateDoc = {
-        $inc: { quantity: 1 },
+          .send({ message: 'Cannot cancel once the product is in progress or delivered!' })
       }
-      const filter = { _id: new ObjectId(order.plantId) }
-      const updatedResult = await plantsCollection.updateOne(filter, updateDoc)
+
+      // Restore quantity for each plant
+      for (const order of ordersToCancel) {
+        await plantsCollection.updateOne(
+          { _id: new ObjectId(order.plantId) },
+          { $inc: { quantity: order.quantity } }
+        )
+      }
+
+      const result = await ordersCollection.deleteMany(filter)
       res.send(result)
     })
 
@@ -344,11 +387,32 @@ async function run() {
     app.patch('/orders/status/:id', verifyJWT, async (req, res) => {
       const id = req.params.id
       const status = req.body.status
-      const query = { _id: new ObjectId(id) }
-      const updateDoc = {
-        $set: { status: status },
+      const requesterEmail = req.tokenEmail
+
+      const targetOrder = await ordersCollection.findOne({ _id: new ObjectId(id) })
+      if (!targetOrder) {
+        return res.status(404).send({ message: 'Order not found' })
       }
-      const result = await ordersCollection.updateOne(query, updateDoc)
+
+      // Check role of requester
+      const user = await usersCollection.findOne({ email: requesterEmail })
+      const isAdmin = user && user.role === 'admin'
+
+      const transactionId = targetOrder.transactionId
+
+      // Define filter to update orders under the same transaction
+      let filter = { transactionId: transactionId }
+      if (!isAdmin && user && user.role === 'seller') {
+        filter = {
+          transactionId: transactionId,
+          $or: [
+            { seller: requesterEmail },
+            { 'seller.email': requesterEmail }
+          ]
+        }
+      }
+
+      const result = await ordersCollection.updateMany(filter, { $set: { status: status } })
       res.send(result)
     })
 
@@ -564,6 +628,38 @@ async function run() {
       const plantId = req.params.plantId
       const query = { plantId: plantId }
       const result = await reviewsCollection.find(query).sort({ timestamp: -1 }).toArray()
+      res.send(result)
+    })
+
+    // Get all reviews (Admin only)
+    app.get('/all-reviews', verifyJWT, async (req, res) => {
+      const requesterEmail = req.tokenEmail
+      console.log('all-reviews hit. requesterEmail:', requesterEmail)
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+      console.log('requesterUser:', requesterUser)
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        console.log('Access forbidden. Role:', requesterUser?.role)
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const result = await reviewsCollection.find().sort({ timestamp: -1 }).toArray()
+      console.log('Sending reviews count:', result.length)
+      res.send(result)
+    })
+
+    // Delete a review (Admin only)
+    app.delete('/reviews/:id', verifyJWT, async (req, res) => {
+      const requesterEmail = req.tokenEmail
+      const requesterUser = await usersCollection.findOne({ 
+        email: { $regex: new RegExp(`^${requesterEmail}$`, 'i') } 
+      })
+      if (!requesterUser || requesterUser.role !== 'admin') {
+        return res.status(403).send({ message: 'Forbidden access' })
+      }
+      const id = req.params.id
+      const query = { _id: new ObjectId(id) }
+      const result = await reviewsCollection.deleteOne(query)
       res.send(result)
     })
 
