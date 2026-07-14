@@ -643,7 +643,41 @@ async function run() {
         console.log('Access forbidden. Role:', requesterUser?.role)
         return res.status(403).send({ message: 'Forbidden access' })
       }
-      const result = await reviewsCollection.find().sort({ timestamp: -1 }).toArray()
+      const result = await reviewsCollection.aggregate([
+        {
+          $addFields: {
+            plantObjectId: { $toObjectId: "$plantId" }
+          }
+        },
+        {
+          $lookup: {
+            from: "plants",
+            localField: "plantObjectId",
+            foreignField: "_id",
+            as: "plantDetails"
+          }
+        },
+        {
+          $unwind: {
+            path: "$plantDetails",
+            preserveNullAndEmptyArrays: true
+          }
+        },
+        {
+          $addFields: {
+            plantName: "$plantDetails.name"
+          }
+        },
+        {
+          $project: {
+            plantDetails: 0,
+            plantObjectId: 0
+          }
+        },
+        {
+          $sort: { timestamp: -1 }
+        }
+      ]).toArray()
       console.log('Sending reviews count:', result.length)
       res.send(result)
     })
