@@ -720,6 +720,12 @@ async function run() {
       res.send(result)
     })
 
+    // Public endpoint to show active coupons on Home page
+    app.get('/public-coupons', async (req, res) => {
+      const result = await couponsCollection.find().sort({ _id: -1 }).toArray()
+      res.send(result)
+    })
+
     app.delete('/coupons/:id', verifyJWT, async (req, res) => {
       const requesterEmail = req.tokenEmail
       const requesterUser = await usersCollection.findOne({ 
